@@ -1,3 +1,4 @@
+import base64
 import csv
 from datetime import datetime
 import io
@@ -11,14 +12,46 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, Response
 import face_recognition
 import numpy as np
+import requests
 
 app = FastAPI(title="FaceMark Attendance Server")
 
 ENCODINGS_DIR = "known_encodings"
 os.makedirs(ENCODINGS_DIR, exist_ok=True)
 
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
+
 live_present = set()
 challenge_tracker = {}
+
+
+def push_pkl_to_github(filename: str, pkl_bytes: bytes) -> bool:
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return False
+
+    api_url = f"https://github.com{GITHUB_REPO}/contents/{ENCODINGS_DIR}/{filename}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    sha = None
+    get_res = requests.get(f"{api_url}?ref={GITHUB_BRANCH}", headers=headers, timeout=10)
+    if get_res.status_code == 200:
+        sha = get_res.json().get("sha")
+
+    payload = {
+        "message": f"Add face encoding {filename} via mobile scanner",
+        "content": base64.b64encode(pkl_bytes).decode("utf-8"),
+        "branch": GITHUB_BRANCH,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    put_res = requests.put(api_url, headers=headers, json=payload, timeout=15)
+    return put_res.status_code in (200, 201)
 
 
 def load_known_profiles():
@@ -79,6 +112,7 @@ def get_profiles():
 @app.post("/register-bulk")
 async def register_bulk(files: List[UploadFile] = File(...)):
     saved = []
+    github_synced = []
     skipped = []
 
     for uploaded_file in files:
@@ -102,15 +136,21 @@ async def register_bulk(files: List[UploadFile] = File(...)):
         elif len(encs) > 1:
             skipped.append(f"{uploaded_file.filename} (multiple faces found)")
         else:
-            save_path = os.path.join(ENCODINGS_DIR, f"{base_name}.pkl")
+            pkl_filename = f"{base_name}.pkl"
+            pkl_bytes = pickle.dumps(encs[0])
+            save_path = os.path.join(ENCODINGS_DIR, pkl_filename)
             with open(save_path, "wb") as f:
-                pickle.dump(encs[0], f)
+                f.write(pkl_bytes)
             saved.append(base_name)
+
+            if push_pkl_to_github(pkl_filename, pkl_bytes):
+                github_synced.append(base_name)
 
     _, names = load_known_profiles()
     absent = sorted([p for p in names if p not in live_present])
     return {
         "saved": saved,
+        "github_synced": github_synced,
         "skipped": skipped,
         "present": sorted(list(live_present)),
         "absent": absent,
@@ -320,12 +360,12 @@ def mobile_client_ui():
 </div>
 
 <div class="reg-box">
-  <b>Add New Profiles (Bulk Photo Upload)</b>
+  <b>Add New Profiles (Permanent GitHub Sync)</b>
   <div style="font-size:12px; color:#bbb; margin:4px 0 8px 0;">
     Select one or more solo photos. Each file is saved using its filename (e.g., Ashish_Ghule_Roll_25.jpg).
   </div>
   <input type="file" id="profileFiles" accept="image/*" multiple style="width:100%; color:#fff;">
-  <button class="upload-btn" onclick="uploadProfiles()">Upload & Create Profiles</button>
+  <button class="upload-btn" onclick="uploadProfiles()">Upload & Save Permanently</button>
   <div id="uploadStatus" style="margin-top:8px; font-size:13px; color:#ffd740;"></div>
 </div>
 <script>
@@ -460,7 +500,7 @@ async function uploadProfiles() {
     statusEl.innerText = "Please select at least one photo first.";
     return;
   }
-  statusEl.innerText = `Uploading ${input.files.length} photo(s) and generating encodings...`;
+  statusEl.innerText = `Uploading ${input.files.length} photo(s) & syncing to GitHub...`;
   const form = new FormData();
   for (const file of input.files) {
     form.append("files", file);
@@ -469,7 +509,7 @@ async function uploadProfiles() {
     const res = await fetch("/register-bulk", { method: "POST", body: form });
     const data = await res.json();
     updateUI(data);
-    let msg = `Saved ${data.saved.length} profile(s).`;
+    let msg = `Saved ${data.saved.length} profile(s) (${data.github_synced.length} synced to GitHub).`;
     if (data.skipped.length > 0) {
       msg += ` Skipped: ${data.skipped.join(", ")}`;
     }
