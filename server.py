@@ -5,6 +5,7 @@ import os
 import pickle
 import random
 import time
+from typing import List
 import cv2
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, Response
@@ -75,6 +76,47 @@ def get_profiles():
     }
 
 
+@app.post("/register-bulk")
+async def register_bulk(files: List[UploadFile] = File(...)):
+    saved = []
+    skipped = []
+
+    for uploaded_file in files:
+        stem, _ = os.path.splitext(uploaded_file.filename or "")
+        base_name = stem.strip()
+        if not base_name:
+            continue
+
+        img_bytes = await uploaded_file.read()
+        arr = np.frombuffer(img_bytes, np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            skipped.append(f"{uploaded_file.filename} (invalid image)")
+            continue
+
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        encs = face_recognition.face_encodings(rgb)
+
+        if len(encs) == 0:
+            skipped.append(f"{uploaded_file.filename} (no face found)")
+        elif len(encs) > 1:
+            skipped.append(f"{uploaded_file.filename} (multiple faces found)")
+        else:
+            save_path = os.path.join(ENCODINGS_DIR, f"{base_name}.pkl")
+            with open(save_path, "wb") as f:
+                pickle.dump(encs[0], f)
+            saved.append(base_name)
+
+    _, names = load_known_profiles()
+    absent = sorted([p for p in names if p not in live_present])
+    return {
+        "saved": saved,
+        "skipped": skipped,
+        "present": sorted(list(live_present)),
+        "absent": absent,
+    }
+
+
 @app.post("/scan-frame")
 async def scan_frame(
     file: UploadFile = File(...),
@@ -110,7 +152,6 @@ async def scan_frame(
     for (top, right, bottom, left), enc, landmarks in zip(
         locations, encodings, landmarks_list
     ):
-        # Normalized 0.0 to 1.0 coordinates so phone canvas draws boxes accurately
         norm_box = {
             "top": round(top / img_h, 4),
             "right": round(right / img_w, 4),
@@ -157,7 +198,6 @@ async def scan_frame(
                         state["blink_closed"] = False
                 else:
                     yaw = compute_head_yaw_ratio(landmarks)
-                    # Adjust left/right check based on front-camera mirror mode
                     if action == "TURN_LEFT":
                         passed = (yaw < 0.36) if mirror else (yaw > 0.64)
                     elif action == "TURN_RIGHT":
@@ -242,11 +282,13 @@ def mobile_client_ui():
   .stop { background: #ff5252; color: #fff; }
   .flip { background: #448aff; color: #fff; }
   .csv { background: #ffd740; color: #000; }
+  .upload-btn { background: #b388ff; color: #000; width: 100%; margin-top: 8px; }
   .status-box { background: #1e1e1e; padding: 10px; border-radius: 8px; margin-bottom: 10px; font-size: 15px; }
-  .lists { display: flex; gap: 10px; }
+  .lists { display: flex; gap: 10px; margin-bottom: 14px; }
   .card { flex: 1; padding: 10px; border-radius: 8px; font-size: 14px; }
   .present { background: #1b5e20; }
   .absent { background: #b71c1c; }
+  .reg-box { background: #1e1e1e; padding: 12px; border-radius: 8px; border: 1px solid #333; }
   ul { padding-left: 18px; margin: 6px 0 0 0; }
 </style>
 </head>
@@ -277,6 +319,15 @@ def mobile_client_ui():
   <div class="card absent"><b>Absent (<span id="aCount">0</span>)</b><ul id="aList"></ul></div>
 </div>
 
+<div class="reg-box">
+  <b>Add New Profiles (Bulk Photo Upload)</b>
+  <div style="font-size:12px; color:#bbb; margin:4px 0 8px 0;">
+    Select one or more solo photos. Each file is saved using its filename (e.g., Ashish_Ghule_Roll_25.jpg).
+  </div>
+  <input type="file" id="profileFiles" accept="image/*" multiple style="width:100%; color:#fff;">
+  <button class="upload-btn" onclick="uploadProfiles()">Upload & Create Profiles</button>
+  <div id="uploadStatus" style="margin-top:8px; font-size:13px; color:#ffd740;"></div>
+</div>
 <script>
 let stream = null, scanning = false, resetting = false, facingMode = "user";
 const video = document.getElementById("video");
@@ -297,7 +348,7 @@ async function startCamera() {
     document.getElementById("toggleBtn").className = "stop";
     scanLoop();
   } catch (err) {
-    document.getElementById("status").innerText = "Camera blocked: Open via HTTPS tunnel URL.";
+    document.getElementById("status").innerText = "Camera blocked: Allow camera permissions in browser.";
   }
 }
 
@@ -393,13 +444,40 @@ function updateUI(data) {
   const statusEl = document.getElementById("status");
   if (data.detections && data.detections.length > 0) {
     statusEl.innerHTML = data.detections.map(d => `<b>${d.name}</b>: ${d.status}`).join("<br>");
-  } else {
+  } else if (scanning) {
     statusEl.innerText = "Scanning for faces...";
   }
   document.getElementById("pCount").innerText = data.present.length;
   document.getElementById("aCount").innerText = data.absent.length;
   document.getElementById("pList").innerHTML = data.present.map(n => `<li>${n}</li>`).join("");
   document.getElementById("aList").innerHTML = data.absent.map(n => `<li>${n}</li>`).join("");
+}
+
+async function uploadProfiles() {
+  const input = document.getElementById("profileFiles");
+  const statusEl = document.getElementById("uploadStatus");
+  if (!input.files || input.files.length === 0) {
+    statusEl.innerText = "Please select at least one photo first.";
+    return;
+  }
+  statusEl.innerText = `Uploading ${input.files.length} photo(s) and generating encodings...`;
+  const form = new FormData();
+  for (const file of input.files) {
+    form.append("files", file);
+  }
+  try {
+    const res = await fetch("/register-bulk", { method: "POST", body: form });
+    const data = await res.json();
+    updateUI(data);
+    let msg = `Saved ${data.saved.length} profile(s).`;
+    if (data.skipped.length > 0) {
+      msg += ` Skipped: ${data.skipped.join(", ")}`;
+    }
+    statusEl.innerText = msg;
+    input.value = "";
+  } catch (e) {
+    statusEl.innerText = "Upload failed. Check server connection.";
+  }
 }
 
 async function resetList() {
