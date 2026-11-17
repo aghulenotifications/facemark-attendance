@@ -4,5 +4,5 @@ python-multipart
 numpy<2.0
 opencv-python-headless
 dlib-bin
-face-recognition-models
-face_recognition --no-deps
+Click
+Pillow
